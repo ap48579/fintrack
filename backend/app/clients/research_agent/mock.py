@@ -1,6 +1,6 @@
 """Builds a deterministic, plausible report from the real (keyless) GDELT/EDGAR context passed
-in, plus the mocked Reddit posts — no LLM call. Swap to AnthropicResearchAgentClient once
-ANTHROPIC_API_KEY is configured; same method signature, same persisted shape."""
+in, plus the mocked Reddit posts — no LLM call. Used when RESEARCH_AGENT_IMPL=mock.
+Set RESEARCH_AGENT_IMPL=ollama to use OllamaResearchAgentClient with deepseek-r1:7b instead."""
 
 import random
 import re

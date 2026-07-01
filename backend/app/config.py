@@ -20,14 +20,16 @@ class Settings(BaseSettings):
     # External data sources
     alpha_vantage_api_key: str = ""
 
-    # Pillar 4 client selection (mock until real credentials exist)
+    # Pillar 4 client selection
     reddit_client_impl: str = "mock"
     reddit_client_id: str = ""
     reddit_client_secret: str = ""
     reddit_user_agent: str = "fintrack/0.1"
 
-    research_agent_impl: str = "mock"
-    anthropic_api_key: str = ""
+    # Research agent — "ollama" (default) or "mock" (no LLM, deterministic stubs)
+    research_agent_impl: str = "ollama"
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "deepseek-r1:7b"
 
     # Web push (Checkpoint 6)
     vapid_public_key: str = ""
