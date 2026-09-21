@@ -8,28 +8,52 @@
 
 import asyncio
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from statistics import mean
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
 
 from app.clients import gdelt_client
 from app.clients.reddit import get_reddit_client
 from app.clients.research_agent import get_research_agent_client
-from app.clients.research_agent.base import ResearchContext
-from app.models.research import ResearchCandidate, ResearchReport, ResearchSource, ResearchTickerLink
+from app.clients.research_agent._context_sources import build_sources_from_context
+from app.clients.research_agent.base import ResearchContext, ResearchSourceRef
+from app.db.sync import get_sync_db
+from app.models.research import (
+    ResearchCandidate,
+    ResearchChatContext,
+    ResearchChatMessage,
+    ResearchReport,
+    ResearchSource,
+    ResearchTickerLink,
+)
 from app.models.ticker import Ticker
 from app.models.user import Watchlist
-from app.services import alert_engine, fundamentals_service, price_service, whales_service
+from app.services import alert_engine, fundamentals_service, price_service, signals_service, whales_service
 
 logger = logging.getLogger(__name__)
 
 VOLUME_SPIKE_RATIO = 2.0  # today's volume vs trailing-average must be at least 2x to flag
 TONE_SHIFT_THRESHOLD = 3.0  # GDELT "Average Tone" points (roughly -10..+10 scale)
 TIMELINE_DAYS = 14
+
+# Deep-research news pull: a wider window/count than the passive scan's timeline query, plus an
+# OR-expansion so a plain company-name query doesn't just surface generic market-recap noise —
+# GDELT indexes broadly enough (240+ languages, tens of thousands of sources) that the gap versus
+# a paid news API is mostly about *asking it the right question*, not needing a different source.
+NEWS_LOOKBACK_DAYS = 30
+NEWS_MAX_ARTICLES = 30
+_NEWS_SIGNAL_TERMS = (
+    "partnership OR acquisition OR merger OR lawsuit OR settlement OR investigation OR recall "
+    'OR "FDA" OR approval OR earnings OR guidance OR layoffs OR contract OR breakthrough OR patent'
+)
+
+
+def _build_news_query(subject_name: str) -> str:
+    return f'"{subject_name}" ({_NEWS_SIGNAL_TERMS})'
 
 
 def _scan_ticker(ticker: Ticker) -> tuple[str, float] | None:
@@ -152,7 +176,23 @@ async def _build_market_snapshot(db: AsyncSession, ticker_symbol: str) -> dict:
         snapshot["whale_holders"] = []
         snapshot["whale_recent_activity"] = []
 
+    disclosed_trades = await asyncio.to_thread(_fetch_disclosed_trades_sync, ticker_symbol)
+    snapshot["disclosed_trades"] = [{**t, "date": t["date"].isoformat(), "transaction_date": t["transaction_date"].isoformat()} for t in disclosed_trades]
+
     return snapshot
+
+
+def _fetch_disclosed_trades_sync(ticker_symbol: str) -> list[dict]:
+    """Recent Form 4 insider and House PTR congressional buys/sells for this ticker — run in a
+    thread with its own sync session, matching how whale holdings/activity would be fetched if
+    they didn't already have async variants (see whales_service's *_async functions)."""
+    with get_sync_db() as sync_db:
+        ticker_row = sync_db.scalar(select(Ticker).where(Ticker.symbol == ticker_symbol.upper()))
+        if not ticker_row:
+            return []
+        insider = signals_service.get_insider_signals(sync_db, limit=10, ticker_id=ticker_row.id)
+        congress = signals_service.get_congress_signals(sync_db, limit=10, ticker_id=ticker_row.id)
+        return sorted(insider + congress, key=lambda s: s["date"], reverse=True)[:10]
 
 
 def _format_market_snapshots_section(snapshots: list[dict]) -> str:
@@ -176,6 +216,11 @@ def _format_market_snapshots_section(snapshots: list[dict]) -> str:
                 f"{a['institution']} {a['change_type']} ({a['period']})" for a in s["whale_recent_activity"]
             )
             lines.append(f"- Recent whale activity: {activity_str}")
+        if s.get("disclosed_trades"):
+            trades_str = "; ".join(
+                f"{t['actor']} {t['direction']} ({t['amount_label']}, filed {t['date']})" for t in s["disclosed_trades"]
+            )
+            lines.append(f"- Disclosed insider/congressional trades: {trades_str}")
     return "\n".join(lines)
 
 
@@ -186,10 +231,21 @@ async def trigger_research_stream(db: AsyncSession, subject_type: str, subject: 
     its ticker symbol for subject_type == "ticker"; left as free text for "theme"."""
     subject = subject.upper() if subject_type == "ticker" else subject.strip()
 
-    yield {"step": f"Searching news for {subject}…"}
-    gdelt_articles = await asyncio.to_thread(gdelt_client.get_articles, subject, days=7, max_records=10)
+    news_subject_name = subject
+    if subject_type == "ticker":
+        ticker_row = await db.scalar(select(Ticker).where(Ticker.symbol == subject))
+        if ticker_row:
+            news_subject_name = ticker_row.name
 
-    yield {"step": "Searching Reddit discussions…"}
+    yield {"step": f"Searching news for {news_subject_name} (partnerships, regulatory, earnings, and more)…"}
+    gdelt_articles = await asyncio.to_thread(
+        gdelt_client.get_articles,
+        _build_news_query(news_subject_name),
+        days=NEWS_LOOKBACK_DAYS,
+        max_records=NEWS_MAX_ARTICLES,
+    )
+
+    yield {"step": "Checking Reddit for community sentiment…"}
     reddit_posts = await get_reddit_client().search(subject, limit=10)
 
     filings: list[dict] = []
@@ -306,3 +362,159 @@ async def get_recent_reports(db: AsyncSession, limit: int = 20) -> list[Research
         select(ResearchReport).options(*_REPORT_LOAD_OPTIONS).order_by(ResearchReport.created_at.desc()).limit(limit)
     )
     return list(result.scalars().all())
+
+
+# --- C. Inline per-ticker research chat ------------------------------------------------------
+# A conversational alternative to the report-per-run flow above: one growing thread per ticker,
+# backed by a context bundle that's fetched once and reused across follow-up questions instead
+# of re-hitting GDELT/EDGAR/whales on every message.
+
+CHAT_CONTEXT_TTL_HOURS = 6
+
+DEFAULT_CHAT_PROMPT = (
+    "Give me a comprehensive research analysis of {ticker}. Cover: recent news (partnerships, "
+    "product/regulatory/FDA developments, earnings, legal/contract activity), insider and "
+    "congressional trading activity, institutional (13F) holdings changes, and your overall "
+    "sentiment with reasoning. If the context is thin on any of these, say so plainly rather "
+    "than guessing."
+)
+
+
+async def _fetch_chat_context(db: AsyncSession, ticker_symbol: str) -> tuple[ResearchContext, list[ResearchSourceRef]]:
+    """Same ingredients as the ticker branch of trigger_research_stream (wide GDELT pull, Reddit
+    sentiment, filings, market/whale/disclosed-trades snapshot), assembled once per ticker."""
+    ticker_row = await db.scalar(select(Ticker).where(Ticker.symbol == ticker_symbol))
+    news_subject_name = ticker_row.name if ticker_row else ticker_symbol
+
+    gdelt_articles = await asyncio.to_thread(
+        gdelt_client.get_articles,
+        _build_news_query(news_subject_name),
+        days=NEWS_LOOKBACK_DAYS,
+        max_records=NEWS_MAX_ARTICLES,
+    )
+    reddit_posts = await get_reddit_client().search(ticker_symbol, limit=10)
+    try:
+        filings = await asyncio.to_thread(fundamentals_service.get_filings, ticker_symbol, limit=5)
+    except Exception:
+        logger.warning("Could not fetch filings for chat context on %s", ticker_symbol)
+        filings = []
+    market_snapshot = await _build_market_snapshot(db, ticker_symbol)
+
+    context = ResearchContext(
+        gdelt_articles=gdelt_articles, reddit_posts=reddit_posts, filings=filings, market_snapshots=[market_snapshot]
+    )
+    return context, build_sources_from_context(context)
+
+
+async def get_or_refresh_chat_context(
+    db: AsyncSession, ticker_symbol: str, force: bool = False
+) -> tuple[ResearchContext, list[ResearchSourceRef]]:
+    ticker_symbol = ticker_symbol.upper()
+    row = await db.scalar(select(ResearchChatContext).where(ResearchChatContext.ticker == ticker_symbol))
+    is_stale = row is None or (datetime.now(UTC) - row.fetched_at) > timedelta(hours=CHAT_CONTEXT_TTL_HOURS)
+
+    if row is not None and not force and not is_stale:
+        return ResearchContext.model_validate(row.context_json), [
+            ResearchSourceRef.model_validate(s) for s in row.sources_json
+        ]
+
+    context, sources = await _fetch_chat_context(db, ticker_symbol)
+    sources_json = [s.model_dump(mode="json") for s in sources]
+    if row is None:
+        row = ResearchChatContext(
+            ticker=ticker_symbol,
+            context_json=context.model_dump(mode="json"),
+            sources_json=sources_json,
+            fetched_at=datetime.now(UTC),
+        )
+        db.add(row)
+    else:
+        row.context_json = context.model_dump(mode="json")
+        row.sources_json = sources_json
+        row.fetched_at = datetime.now(UTC)
+    await db.commit()
+    return context, sources
+
+
+async def get_chat_thread(
+    db: AsyncSession, ticker_symbol: str
+) -> tuple[list[ResearchChatMessage], list[ResearchSourceRef]]:
+    ticker_symbol = ticker_symbol.upper()
+    result = await db.execute(
+        select(ResearchChatMessage)
+        .where(ResearchChatMessage.ticker == ticker_symbol)
+        .order_by(ResearchChatMessage.created_at)
+    )
+    messages = list(result.scalars().all())
+
+    context_row = await db.scalar(select(ResearchChatContext).where(ResearchChatContext.ticker == ticker_symbol))
+    sources = [ResearchSourceRef.model_validate(s) for s in context_row.sources_json] if context_row else []
+    return messages, sources
+
+
+async def reset_chat_thread(db: AsyncSession, ticker_symbol: str) -> None:
+    ticker_symbol = ticker_symbol.upper()
+    await db.execute(delete(ResearchChatMessage).where(ResearchChatMessage.ticker == ticker_symbol))
+    await db.execute(delete(ResearchChatContext).where(ResearchChatContext.ticker == ticker_symbol))
+    await db.commit()
+
+
+async def stream_chat_message(db: AsyncSession, ticker_symbol: str, user_message: str | None):
+    """SSE-friendly generator for the inline research chat: yields `{"thinking": delta}` and
+    `{"content": delta}` events as the model streams (Ollama's `think`-separated output), then a
+    final `{"done": True, "message_id": ..., "sources": [...]}` once the turn is persisted."""
+    ticker_symbol = ticker_symbol.upper()
+    client = get_research_agent_client()
+
+    prior_messages, _ = await get_chat_thread(db, ticker_symbol)
+    context, sources = await get_or_refresh_chat_context(db, ticker_symbol)
+
+    if user_message:
+        db.add(
+            ResearchChatMessage(
+                ticker=ticker_symbol, role="user", content=user_message, thinking=None, created_at=datetime.now(UTC)
+            )
+        )
+        await db.commit()
+
+    # The comprehensive-analysis instruction only belongs on a true cold start (no history, no
+    # specific question) — it must NOT be prepended ahead of a real follow-up question, or the
+    # model anchors on "cover news/insider/congress/13F/sentiment" and answers that instead of
+    # what was actually asked (e.g. "what does V stand for" got a full sector-style report,
+    # because the model saw the comprehensive-analysis prompt as message #1 either way).
+    if not prior_messages and not user_message:
+        llm_messages = [{"role": "user", "content": DEFAULT_CHAT_PROMPT.format(ticker=ticker_symbol)}]
+    else:
+        llm_messages = [{"role": m.role, "content": m.content} for m in prior_messages]
+        if user_message:
+            llm_messages.append({"role": "user", "content": user_message})
+
+    thinking_parts: list[str] = []
+    content_parts: list[str] = []
+    try:
+        async for chunk in client.stream_chat(llm_messages, context, ticker_symbol):
+            if chunk.thinking:
+                thinking_parts.append(chunk.thinking)
+                yield {"thinking": chunk.thinking}
+            if chunk.content:
+                content_parts.append(chunk.content)
+                yield {"content": chunk.content}
+    except NotImplementedError:
+        yield {"error": "The configured research agent doesn't support live chat (Ollama only, for now)."}
+        return
+
+    assistant_row = ResearchChatMessage(
+        ticker=ticker_symbol,
+        role="assistant",
+        content="".join(content_parts),
+        thinking="".join(thinking_parts) or None,
+        created_at=datetime.now(UTC),
+    )
+    db.add(assistant_row)
+    await db.commit()
+
+    yield {
+        "done": True,
+        "message_id": str(assistant_row.id),
+        "sources": [s.model_dump(mode="json") for s in sources],
+    }

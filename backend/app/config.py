@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     research_agent_impl: str = "mock"
     anthropic_api_key: str = ""
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "deepseek-r1:7b"
 
     # Web push (Checkpoint 6)
     vapid_public_key: str = ""

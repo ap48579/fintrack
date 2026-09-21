@@ -78,3 +78,22 @@ class ResearchReportSummary(BaseModel):
     sentiment_direction: str
 
     model_config = {"from_attributes": True}
+
+
+class ChatMessageItem(BaseModel):
+    id: UUID
+    role: Literal["user", "assistant"]
+    content: str
+    thinking: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ChatThreadResponse(BaseModel):
+    messages: list[ChatMessageItem]
+    sources: list[ResearchSourceItem]
+
+
+class ChatSendRequest(BaseModel):
+    message: str | None = None  # omit/empty for "run the default analysis"

@@ -310,6 +310,50 @@ def refresh_institution_holdings(db: Session, institution: Institution, force: b
     return True
 
 
+def backfill_institution_history(db: Session, institution: Institution, target_quarters: int = 8) -> int:
+    """Walks an institution's 13F-HR history back further than refresh_institution_holdings ever
+    does (that function only ever keeps 2 quarters' worth of diff-basis). Fetches up to
+    `target_quarters` most recent filings, stores any periods not already on record, and diffs
+    each consecutive pair that hasn't been diffed yet. Returns the number of new HoldingsChange
+    rows created. Safe to re-run — skips periods/diffs already present instead of duplicating."""
+    filings = edgar_client.get_13f_filings(institution.cik, limit=target_quarters)
+    if not filings:
+        return 0
+
+    # Oldest first, so diffs are computed in chronological order.
+    filings_with_periods = []
+    for filing in filings:
+        try:
+            period = edgar_client.get_period_of_report(institution.cik, filing["accession"])
+        except Exception:
+            logger.exception("Could not resolve period for %s accession %s", institution.name, filing["accession"])
+            continue
+        filings_with_periods.append((period, filing["accession"]))
+    filings_with_periods.sort(key=lambda p: p[0])
+
+    known_periods = set(_existing_periods(db, institution.id))
+    for period, accession in filings_with_periods:
+        if period not in known_periods:
+            _fetch_and_store_period(db, institution, institution.cik, accession, period)
+            known_periods.add(period)
+            db.commit()
+
+    new_changes = 0
+    for (prior_period, _), (current_period, _) in zip(filings_with_periods, filings_with_periods[1:]):
+        already_diffed = db.scalar(
+            select(HoldingsChange.id).where(
+                HoldingsChange.institution_id == institution.id, HoldingsChange.period == current_period
+            )
+        )
+        if already_diffed:
+            continue
+        changes = _diff_periods(db, institution, prior_period, current_period)
+        new_changes += len(changes)
+        db.commit()
+
+    return new_changes
+
+
 def get_ticker_holders(db: Session, ticker: Ticker) -> list[dict]:
     """Tracked institutions currently holding this ticker, at each institution's latest period."""
     results = []

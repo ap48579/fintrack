@@ -30,6 +30,11 @@ export interface HistoryResponse {
   ma200: LinePoint[];
 }
 
+export interface TickerSearchResult {
+  symbol: string;
+  name: string;
+}
+
 export interface WatchlistItem {
   ticker_id: string;
   symbol: string;
@@ -104,6 +109,63 @@ export interface ActivityItem {
   magnitude: number;
 }
 
+export interface SignalItem {
+  source: "insider" | "congress" | "whale";
+  ticker: string | null;
+  direction: string;
+  actor: string;
+  actor_detail: string | null;
+  amount_label: string;
+  detail: string | null;
+  date: string;
+  transaction_date: string;
+  lag_days: number | null;
+}
+
+export interface DomainTickerItem {
+  ticker: string;
+  name: string;
+  weight: number;
+  sources: SignalItem["source"][];
+}
+
+export interface VerdictItem {
+  ticker: string;
+  bull_case: string;
+  bear_case: string;
+  verdict: "bullish" | "bearish" | "neutral";
+  confidence: number;
+  key_risks: string;
+  key_catalysts: string;
+  generated_at: string;
+}
+
+export interface DomainGroup {
+  sector: string;
+  tickers: DomainTickerItem[];
+}
+
+export interface HypothesisRunSummary {
+  run_at: string;
+  data_window_start: string;
+  data_window_end: string;
+  sample_size: number;
+  results: Record<string, { n: number; mean_excess?: number; median_excess?: number; win_rate?: number; note?: string }>;
+}
+
+export interface HypothesisItem {
+  name: string;
+  description: string;
+  source: string;
+  params: Record<string, unknown>;
+  latest_run: HypothesisRunSummary | null;
+}
+
+export interface SignalPage {
+  items: SignalItem[];
+  total: number;
+}
+
 export interface CandidateItem {
   subject_type: "ticker" | "theme";
   subject: string;
@@ -137,6 +199,19 @@ export interface ResearchReportDetail {
   full_report: string;
   sources: ResearchSourceItem[];
   ticker_links: ResearchTickerLinkItem[];
+}
+
+export interface ChatMessageItem {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  thinking: string | null;
+  created_at: string;
+}
+
+export interface ChatThreadResponse {
+  messages: ChatMessageItem[];
+  sources: ResearchSourceItem[];
 }
 
 export interface ResearchReportSummary {

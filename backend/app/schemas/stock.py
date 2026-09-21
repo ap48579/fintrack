@@ -31,3 +31,8 @@ class HistoryResponse(BaseModel):
     candles: list[CandlePoint]
     ma50: list[LinePoint]
     ma200: list[LinePoint]
+
+
+class TickerSearchResult(BaseModel):
+    symbol: str
+    name: str

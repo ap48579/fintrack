@@ -112,6 +112,8 @@ class AnthropicResearchAgentClient(ResearchAgentClient):
             lines.append(f"    blue whale holders: {s.get('whale_holders') or 'none currently'}")
             if s.get("whale_recent_activity"):
                 lines.append(f"    recent whale activity: {s['whale_recent_activity']}")
+            if s.get("disclosed_trades"):
+                lines.append(f"    disclosed insider/congressional trades: {s['disclosed_trades']}")
         lines.append("")
         lines.append(
             "Use web_search to fill gaps in the above context — including current price/volume, recent "

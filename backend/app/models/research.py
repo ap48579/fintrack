@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import Date, DateTime, Float, ForeignKey, JSON, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -69,3 +69,31 @@ class ResearchTickerLink(Base):
 
     report: Mapped["ResearchReport"] = relationship(back_populates="ticker_links")
     ticker: Mapped["Ticker"] = relationship()
+
+
+class ResearchChatContext(Base):
+    """One cached, pre-fetched research bundle per ticker (news/Reddit/filings/market+whale
+    snapshot) that a whole chat thread reuses — refetched only when explicitly refreshed, so
+    asking three follow-up questions doesn't mean three redundant GDELT/EDGAR round trips."""
+
+    __tablename__ = "research_chat_contexts"
+
+    ticker: Mapped[str] = mapped_column(String(16), primary_key=True)
+    context_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    sources_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResearchChatMessage(Base):
+    """One turn in a per-ticker research chat. `thinking` holds the model's separated reasoning
+    trace (Ollama's `think` field) for assistant turns, so the frontend can show it collapsed
+    under the answer the way it's shown for user-facing reasoning traces elsewhere."""
+
+    __tablename__ = "research_chat_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # user | assistant
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

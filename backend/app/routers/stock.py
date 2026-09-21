@@ -5,16 +5,25 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.clients import edgar_client
 from app.db.base import get_db
 from app.models.ticker import Ticker
 from app.schemas.fundamentals import FilingItem, FundamentalsQuarter, FundamentalsSummary
 from app.schemas.research import ResearchReportSummary
-from app.schemas.stock import HistoryResponse, QuoteResponse
+from app.schemas.stock import HistoryResponse, QuoteResponse, TickerSearchResult
 from app.services import fundamentals_service, price_service, research_service
 
 router = APIRouter(prefix="/stock", tags=["stock"])
 
 RangeKey = Literal["1D", "1W", "1M", "1Y", "5Y"]
+
+
+@router.get("/search", response_model=list[TickerSearchResult])
+async def search_tickers(q: str, limit: int = 8) -> list[TickerSearchResult]:
+    """Typo-tolerant ticker/company-name search (e.g. "Apple" or "aple" -> AAPL) over SEC's
+    full issuer list, not just tickers already looked up in our DB."""
+    results = await asyncio.to_thread(edgar_client.search_companies, q, limit)
+    return [TickerSearchResult(symbol=r["ticker"], name=r["name"]) for r in results]
 
 
 @router.get("/{ticker}/quote", response_model=QuoteResponse)

@@ -10,6 +10,9 @@ from app.db.base import get_db
 from app.db.sync import get_sync_db
 from app.schemas.research import (
     CandidateItem,
+    ChatMessageItem,
+    ChatSendRequest,
+    ChatThreadResponse,
     ResearchReportDetail,
     ResearchReportSummary,
     ResearchTriggerRequest,
@@ -17,6 +20,32 @@ from app.schemas.research import (
 from app.services import research_service
 
 router = APIRouter(prefix="/research", tags=["research"])
+
+
+@router.get("/chat/{ticker}", response_model=ChatThreadResponse)
+async def get_chat_thread(ticker: str, db: AsyncSession = Depends(get_db)) -> ChatThreadResponse:
+    messages, sources = await research_service.get_chat_thread(db, ticker)
+    return ChatThreadResponse(
+        messages=[ChatMessageItem.model_validate(m) for m in messages],
+        sources=[s.model_dump(mode="json") for s in sources],
+    )
+
+
+@router.delete("/chat/{ticker}", status_code=204)
+async def reset_chat_thread(ticker: str, db: AsyncSession = Depends(get_db)) -> None:
+    await research_service.reset_chat_thread(db, ticker)
+
+
+@router.post("/chat/{ticker}/stream")
+async def stream_chat(ticker: str, body: ChatSendRequest, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+    """Server-Sent Events: `{"thinking": "..."}` / `{"content": "..."}` deltas as the model
+    streams, then a final `{"done": true, "message_id": ..., "sources": [...]}` once persisted."""
+
+    async def event_stream():
+        async for event in research_service.stream_chat_message(db, ticker, body.message):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/candidates", response_model=list[CandidateItem])

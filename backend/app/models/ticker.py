@@ -12,7 +12,10 @@ class Ticker(Base):
     __tablename__ = "tickers"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    symbol: Mapped[str] = mapped_column(String(16), unique=True, index=True, nullable=False)
+    # Usually a short equity ticker, but 13F holdings can include bonds/notes, where OpenFIGI's
+    # resolved "symbol" is a longer descriptive string (e.g. "BRKR 6.375 09/01/28") rather than a
+    # true ticker — wide enough to hold those instead of crashing whale-holdings ingestion on them.
+    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     sector: Mapped[str | None] = mapped_column(String(128), nullable=True)
     exchange: Mapped[str | None] = mapped_column(String(32), nullable=True)
